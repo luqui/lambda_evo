@@ -10,40 +10,44 @@ import Prelude hiding (concat, mapM_)
 
 import Bound
 import Control.Applicative
-import Control.Arrow (first)
+import Control.Arrow (first, (>>>))
 import Control.Monad (ap, guard, join)
 import Control.Monad.Trans
-import Control.Monad.Trans.RWS
 import Control.Monad.Trans.Maybe
 import Data.Foldable
 import Data.Functor.Identity
+import Data.List (sortBy)
 import Data.Maybe (catMaybes, fromJust)
+import Data.Ord (comparing)
 import Data.Traversable
 import Data.Void
 import Prelude.Extras
 
-import qualified Data.Map as Map
 import qualified Control.Monad.Random as Rand
+import qualified Control.Monad.Trans.State as State
+import qualified Control.Monad.Trans.RWS as RWS
+import qualified Data.Map as Map
+import qualified Text.Printf as Printf
 
 class (Functor m, Monad m) => MonadStep m where
   step :: m ()
 
 -- TODO convert this to CPS for speed
-newtype AbortT m a = AbortT (MaybeT (RWST Int () Int m) a)
+newtype AbortT m a = AbortT (MaybeT (RWS.RWST Int () Int m) a)
   deriving (Functor, Applicative, Monad)
 
 runAbortT :: (Functor m, Monad m) => Int -> AbortT m a -> m (Maybe a)
-runAbortT limit (AbortT m) = fst <$> evalRWST (runMaybeT m) limit 0
+runAbortT limit (AbortT m) = fst <$> RWS.evalRWST (runMaybeT m) limit 0
 
 runAbort :: Int -> AbortT Identity a -> Maybe a
 runAbort limit m = runIdentity (runAbortT limit m)
 
 instance (Functor m, Monad m) => MonadStep (AbortT m) where
   step = AbortT $ do
-    limit <- lift ask
-    cur <- lift get
+    limit <- lift RWS.ask
+    cur <- lift RWS.get
     if cur < limit
-      then lift . put $! cur+1
+      then lift . RWS.put $! cur+1
       else empty
 
 newtype DoesntAbortT m a = DoesntAbortT { runDoesntAbortT :: m a }
@@ -120,6 +124,31 @@ genTerm genVar size = join . Rand.fromList . concat $ [
   χ True = 1
   χ False = 0
 
+data NameDB a = Name String | Up a
+instance (Show a) => Show (NameDB a) where
+  show (Name s) = s
+  show (Up a) = show a
+
+showTerm :: (Show a) => Term a -> String
+showTerm = \t -> State.evalState (go False False t) (tail varNames)
+  where
+  go :: (Show a) => Bool -> Bool -> Term a -> State.State [String] String
+  go ap lp (Var x) = return $ show x
+  go ap lp (t :@ u) = do
+    t' <- go False True t
+    u' <- go True True u
+    return $ parens ap (t' ++ " " ++ u')
+  go ap lp (Lam body) = do
+    (name:names) <- State.get
+    State.put names
+    let body' = instantiate (const (Var (Name name))) . fmap Up $ body
+    bodyShow <- go False False body'
+    return $ parens lp ("\\" ++ name ++ ". " ++ bodyShow)
+
+  varNames = [] : liftA2 (\x y -> x ++ [y]) varNames ['a'..'z']
+
+  parens True = ("(" ++) . (++ ")")
+  parens False = id
 
 ---------------
 
@@ -133,8 +162,6 @@ genTerm genVar size = join . Rand.fromList . concat $ [
 -- Imagine that we have some term `t`.  The term `I t` has the same normal
 -- form as `t`, but has `I` as a subterm, so `I` would gain some value from it.
 -- But `I` is adding nothing.  Can we make it so that `I` does not gain?
-
-type ScoreMap = Map.Map (Term Void) Double
 
 _LIMIT_ = 500
 _STEPSIZE_ = 0.01
@@ -161,17 +188,28 @@ genFlow genA f = iterateM (step _STEPSIZE_) Map.empty
     return $ case f a of
       Nothing -> m0
       Just (a', dels) ->
-        let weight = Map.findWithDefault 1 a' m0 in
-        foldl' (\m (δ,x) -> Map.insertWith (+) x (weight*δ) m) m0 dels
+        --let weight = Map.findWithDefault 1 a' m0 in
+        let weight = 1 in
+        foldl' (\m (δ,x) -> Map.insertWith (+) x (dt*weight*δ) m) m0 dels
 
 iterateM :: (Functor m, Monad m) => (a -> m a) -> a -> m [a]
 iterateM f x0 = (x0:) <$> (iterateM f =<< f x0)
 
 ------------
 
+displayFlowState :: (Show a) => Map.Map (Term a) Double -> String
+displayFlowState = id
+  >>> Map.assocs
+  >>> sortBy (comparing (negate.snd))
+  >>> map (\(t,r) -> Printf.printf "%+.3f" r ++ "\t" ++ showTerm t)
+  >>> unlines
+
+showPrompt :: String -> IO ()
+showPrompt s = putStrLn s >> return ()
+
 main :: IO ()
 main = do
   gen <- Rand.newStdGen
   let flow = genFlow (genTerm [] _TERMSIZE_) deltas
   let flowValues = Rand.evalRand flow gen
-  mapM_ print flowValues
+  mapM_ (showPrompt.displayFlowState) flowValues
