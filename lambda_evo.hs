@@ -6,7 +6,7 @@
              ScopedTypeVariables,
              TupleSections #-}
 
-import Prelude hiding (concat, mapM_)
+import Prelude hiding (concat, mapM_, sum)
 
 import Bound
 import Control.Applicative
@@ -26,7 +26,8 @@ import Prelude.Extras
 import qualified Control.Monad.Random as Rand
 import qualified Control.Monad.Trans.State as State
 import qualified Control.Monad.Trans.RWS as RWS
-import qualified Data.Map as Map
+import qualified Data.Map.Strict as Map
+import qualified Data.MemoCombinators as Memo
 import qualified Text.Printf as Printf
 
 class (Functor m, Monad m) => MonadStep m where
@@ -106,9 +107,9 @@ type Cloud = Rand.Rand Rand.StdGen
 
 genTerm :: [(Cloud a, Rational)] -> Int -> Cloud (Term a)
 genTerm genVar size = join . Rand.fromList . concat $ [
-    [ (genLam, χ (null genVar || size > 0)) ],
-    [ (genApp, χ (size > 0)) ],
-    (map.first.fmap) Var genVar
+    [ (genLam, χ (null genVar || size > 1)) ],
+    [ (genApp, χ (size > 1)) ],
+    if size <= 1 then (map.first.fmap) Var genVar else []
   ]
   where
   genLam = Lam . dBAbstract <$> genTerm ((return Nothing, 1) : subVar) (size-1)
@@ -123,6 +124,16 @@ genTerm genVar size = join . Rand.fromList . concat $ [
     return (leftR, size-leftR)
   χ True = 1
   χ False = 0
+
+termsOfSize :: Integer -> Integer -> Integer
+termsOfSize = Memo.memo2 Memo.integral Memo.integral go
+  where
+  go _ 0 = 0
+  go vars 1 = vars
+  go vars size =
+    sum [ termsOfSize vars n * termsOfSize vars ((size-1)-n) | n <- [1..(size-1)-1] ] + -- apply
+    termsOfSize (vars+1) (size-1)
+
 
 data NameDB a = Name String | Up a
 instance (Show a) => Show (NameDB a) where
@@ -176,7 +187,7 @@ deltas t = do
   let subs = catMaybes (normalize' <$> subterms normT)
   let scale = 1 / fromIntegral (length subs)
   guard $ not (null subs)
-  return (normT, (-1, normT) : map (scale,) subs)
+  return (normT, {-(-1, normT) :-} map (scale,) subs)
 
 genFlow :: forall a. (Ord a) => Cloud a -> (a -> Maybe (a, [(Double, a)]))
                              -> Cloud [Map.Map a Double]
@@ -188,9 +199,13 @@ genFlow genA f = iterateM (step _STEPSIZE_) Map.empty
     return $ case f a of
       Nothing -> m0
       Just (a', dels) ->
-        --let weight = Map.findWithDefault 1 a' m0 in
-        let weight = 1 in
-        foldl' (\m (δ,x) -> Map.insertWith (+) x (dt*weight*δ) m) m0 dels
+        let weight = Map.findWithDefault 1 a' m0 in
+        foldl' (\m (δ,x) -> accumDefault 1 (+ dt*weight*δ) x m) m0 dels
+
+accumDefault :: (Ord k) => a -> (a -> a) -> k -> Map.Map k a -> Map.Map k a
+accumDefault def mod = Map.alter $ \case
+    Nothing -> Just (mod def)
+    Just x  -> Just (mod x)
 
 iterateM :: (Functor m, Monad m) => (a -> m a) -> a -> m [a]
 iterateM f x0 = (x0:) <$> (iterateM f =<< f x0)
@@ -207,9 +222,13 @@ displayFlowState = id
 showPrompt :: String -> IO ()
 showPrompt s = putStrLn s >> return ()
 
+snipe :: Int -> [a] -> [a]
+snipe n [] = []
+snipe n (x:xs) = x : snipe n (drop (n-1) xs)
+
 main :: IO ()
 main = do
   gen <- Rand.newStdGen
   let flow = genFlow (genTerm [] _TERMSIZE_) deltas
   let flowValues = Rand.evalRand flow gen
-  mapM_ (showPrompt.displayFlowState) flowValues
+  mapM_ (showPrompt.displayFlowState) . snipe 100 $ flowValues
