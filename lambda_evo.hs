@@ -4,15 +4,23 @@
              GeneralizedNewtypeDeriving,
              LambdaCase #-}
 
+import Prelude hiding (concat)
+
 import Bound
 import Control.Applicative
-import Control.Monad (ap)
+import Control.Arrow (first)
+import Control.Monad (ap, join)
 import Control.Monad.Trans
 import Control.Monad.Trans.RWS
 import Control.Monad.Trans.Maybe
 import Data.Foldable
+import Data.Maybe (fromJust)
 import Data.Traversable
+import Data.Void
 import Prelude.Extras
+
+import qualified Data.Map as Map
+import qualified Control.Monad.Random as Rand
 
 class (Functor m, Monad m) => MonadStep m where
   step :: m ()
@@ -35,6 +43,7 @@ newtype DoesntAbortT m a = DoesntAbortT { runDoesntAbortT :: m a }
 instance (Functor m, Monad m) => MonadStep (DoesntAbortT m) where
   step = return ()
 
+---------------
 
 data Term a = Var a | Term a :@ Term a | Lam (Scope () Term a)
   deriving (Eq, Ord, Show, Read, Functor, Foldable, Traversable)
@@ -56,6 +65,10 @@ instance Applicative Term where
 lam :: Eq a => a -> Term a -> Term a
 lam v b = Lam (abstract1 v b)
 
+dBAbstract :: Term (Maybe a) -> Scope () Term a
+dBAbstract = fromJust . sequenceA . abstract (\case Nothing -> Just (); Just _ -> Nothing)
+
+
 normalize :: (MonadStep m) => Term a -> m (Term a)
 normalize (Var v) = return (Var v)
 normalize (a :@ b) = do
@@ -67,7 +80,27 @@ normalize (a :@ b) = do
     other -> (other :@) <$> normalize b
 normalize (Lam body) = do
   let body' = instantiate (const (Var Nothing)) (Just <$> body)
-  body'' <- normalize body'
-  let abstracted = abstract (\case Nothing -> Just (); Just _ -> Nothing) body''
-  let (Just ret) = sequenceA abstracted -- abstracted guaranteed to have no Nothing
-  return (Lam ret)
+  Lam . dBAbstract <$> normalize body'
+
+type Cloud = Rand.Rand Rand.StdGen
+
+genTerm :: [(Cloud a, Rational)] -> Int -> Cloud (Term a)
+genTerm genVar size = join . Rand.fromList . concat $ [
+    [ (genLam, 1) ],
+    [ (genApp, χ (size > 0)) ],
+    (map.first.fmap) Var genVar
+  ]
+  where
+  genLam = Lam . dBAbstract <$> genTerm ((return Nothing, 1) : subVar) (size-1)
+    where
+    subVar = (map.first.fmap) Just genVar
+  genApp = liftA2 (:@) (genTerm genVar (size-1)) (genTerm genVar (size-1))
+  χ True = 1
+  χ False = 0
+
+
+---------------
+
+type ScoreMap = Map.Map (Term Void) Double
+
+
