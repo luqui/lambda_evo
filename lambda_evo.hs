@@ -2,19 +2,22 @@
              DeriveFoldable,
              DeriveTraversable,
              GeneralizedNewtypeDeriving,
-             LambdaCase #-}
+             LambdaCase,
+             ScopedTypeVariables,
+             TupleSections #-}
 
-import Prelude hiding (concat)
+import Prelude hiding (concat, mapM_)
 
 import Bound
 import Control.Applicative
 import Control.Arrow (first)
-import Control.Monad (ap, join)
+import Control.Monad (ap, guard, join)
 import Control.Monad.Trans
 import Control.Monad.Trans.RWS
 import Control.Monad.Trans.Maybe
 import Data.Foldable
-import Data.Maybe (fromJust)
+import Data.Functor.Identity
+import Data.Maybe (catMaybes, fromJust)
 import Data.Traversable
 import Data.Void
 import Prelude.Extras
@@ -26,8 +29,14 @@ class (Functor m, Monad m) => MonadStep m where
   step :: m ()
 
 -- TODO convert this to CPS for speed
-newtype AbortT m a = AbortT { runAbortT :: MaybeT (RWST Int () Int m) a }
+newtype AbortT m a = AbortT (MaybeT (RWST Int () Int m) a)
   deriving (Functor, Applicative, Monad)
+
+runAbortT :: (Functor m, Monad m) => Int -> AbortT m a -> m (Maybe a)
+runAbortT limit (AbortT m) = fst <$> evalRWST (runMaybeT m) limit 0
+
+runAbort :: Int -> AbortT Identity a -> Maybe a
+runAbort limit m = runIdentity (runAbortT limit m)
 
 instance (Functor m, Monad m) => MonadStep (AbortT m) where
   step = AbortT $ do
@@ -65,9 +74,11 @@ instance Applicative Term where
 lam :: Eq a => a -> Term a -> Term a
 lam v b = Lam (abstract1 v b)
 
+dBInstantiate :: Scope () Term a -> Term (Maybe a)
+dBInstantiate = instantiate (const (Var Nothing)) . fmap Just
+
 dBAbstract :: Term (Maybe a) -> Scope () Term a
 dBAbstract = fromJust . sequenceA . abstract (\case Nothing -> Just (); Just _ -> Nothing)
-
 
 normalize :: (MonadStep m) => Term a -> m (Term a)
 normalize (Var v) = return (Var v)
@@ -79,8 +90,13 @@ normalize (a :@ b) = do
       normalize (instantiate1 b body)
     other -> (other :@) <$> normalize b
 normalize (Lam body) = do
-  let body' = instantiate (const (Var Nothing)) (Just <$> body)
+  let body' = dBInstantiate body
   Lam . dBAbstract <$> normalize body'
+
+subterms :: Term a -> [Term a]
+subterms (Var x) = []
+subterms (t :@ u) = [t,u] ++ subterms t ++ subterms u
+subterms (Lam body) = catMaybes (map sequenceA (subterms (dBInstantiate body)))
 
 type Cloud = Rand.Rand Rand.StdGen
 
@@ -107,6 +123,55 @@ genTerm genVar size = join . Rand.fromList . concat $ [
 
 ---------------
 
+-- Let value :: Term -> R be the value judgment function for _closed_ terms.
+-- Then we shall define
+--
+-- value t = sum { ?? value(normalize u) | t is a subterm of u }
+--
+-- subject to some condition ?? which allows the sum to converge.
+--
+-- Imagine that we have some term `t`.  The term `I t` has the same normal
+-- form as `t`, but has `I` as a subterm, so `I` would gain some value from it.
+-- But `I` is adding nothing.  Can we make it so that `I` does not gain?
+
 type ScoreMap = Map.Map (Term Void) Double
 
+_LIMIT_ = 500
+_STEPSIZE_ = 0.01
+_TERMSIZE_ = 50
 
+normalize' :: Term a -> Maybe (Term a)
+normalize' = runAbort _LIMIT_ . normalize
+
+deltas :: Term Void -> Maybe (Term Void, [(Double, Term Void)])
+deltas t = do
+  normT <- normalize' t
+  let subs = catMaybes (normalize' <$> subterms normT)
+  let scale = 1 / fromIntegral (length subs)
+  guard $ not (null subs)
+  return (normT, (-1, normT) : map (scale,) subs)
+
+genFlow :: forall a. (Ord a) => Cloud a -> (a -> Maybe (a, [(Double, a)]))
+                             -> Cloud [Map.Map a Double]
+genFlow genA f = iterateM (step _STEPSIZE_) Map.empty
+  where
+  step :: Double -> Map.Map a Double -> Cloud (Map.Map a Double)
+  step dt m0 = do
+    a <- genA
+    return $ case f a of
+      Nothing -> m0
+      Just (a', dels) ->
+        let weight = Map.findWithDefault 1 a' m0 in
+        foldl' (\m (δ,x) -> Map.insertWith (+) x (weight*δ) m) m0 dels
+
+iterateM :: (Functor m, Monad m) => (a -> m a) -> a -> m [a]
+iterateM f x0 = (x0:) <$> (iterateM f =<< f x0)
+
+------------
+
+main :: IO ()
+main = do
+  gen <- Rand.newStdGen
+  let flow = genFlow (genTerm [] _TERMSIZE_) deltas
+  let flowValues = Rand.evalRand flow gen
+  mapM_ print flowValues
