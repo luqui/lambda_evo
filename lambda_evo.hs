@@ -86,7 +86,7 @@ type Cloud = Rand.Rand Rand.StdGen
 
 genTerm :: [(Cloud a, Rational)] -> Int -> Cloud (Term a)
 genTerm genVar size = join . Rand.fromList . concat $ [
-    [ (genLam, 1) ],
+    [ (genLam, χ (null genVar || size > 0)) ],
     [ (genApp, χ (size > 0)) ],
     (map.first.fmap) Var genVar
   ]
@@ -94,7 +94,13 @@ genTerm genVar size = join . Rand.fromList . concat $ [
   genLam = Lam . dBAbstract <$> genTerm ((return Nothing, 1) : subVar) (size-1)
     where
     subVar = (map.first.fmap) Just genVar
-  genApp = liftA2 (:@) (genTerm genVar (size-1)) (genTerm genVar (size-1))
+  genApp = do
+    (l,r) <- splitSize (size-1)
+    liftA2 (:@) (genTerm genVar l) (genTerm genVar r)
+
+  splitSize size = do
+    leftR <- Rand.getRandomR (0,size)
+    return (leftR, size-leftR)
   χ True = 1
   χ False = 0
 
