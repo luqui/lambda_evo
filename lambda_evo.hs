@@ -91,10 +91,13 @@ normalize (Lam body) = do
   let body' = dBInstantiate body
   Lam . dBAbstract <$> normalize body'
 
-subterms :: Term a -> [Term a]
-subterms (Var x) = []
-subterms (t :@ u) = [t,u] ++ subterms t ++ subterms u
-subterms (Lam body) = catMaybes (map sequenceA (subterms (dBInstantiate body)))
+closedSubterms :: Term a -> [Term a]
+closedSubterms (Var x) = []
+closedSubterms (t :@ u) = checkClosed t ++ checkClosed u
+closedSubterms (Lam body) = catMaybes (map sequenceA (closedSubterms (dBInstantiate body)))
+
+checkClosed :: Term a -> [Term a]
+checkClosed t = maybe (closedSubterms t) (:[]) (traverse (const Nothing) t)
 
 termSize :: (Num b) => Term a -> b
 termSize (Var x) = 1
@@ -207,16 +210,10 @@ normalize' = go _SET_LIMIT_
 deltas :: Term Void -> Maybe (Term Void, [(Double, Term Void)])
 deltas t = do
   normT <- normalize' t
-  let subs = catMaybes (normalize' <$> subterms normT)
+  let subs = catMaybes (normalize' <$> closedSubterms normT)
   let scale = 1 / fromIntegral (length subs)
   guard $ not (null subs)
-  -- (termsize s)^2:
-  --   One termsize s because smaller terms will be traversed more frequently
-  --     in proportion to their size.  (They are also more likely to be closed?)
-  --   Another termsize s because there are fewer small terms than large ones,
-  --     proportional to log (termsOfSize 0 (termSize s)) =~ termSize s.
-  --     The log is a gut feeling right now...
-  return (normT, map (\s -> ((termSize s)^2 * scale,s)) subs)
+  return (normT, map (\s -> (termSize s * scale,s)) subs)
 
 genFlow :: forall a. (Ord a) => Cloud a -> (a -> Maybe (a, [(Double, a)]))
                              -> Cloud [Map.Map a Double]
