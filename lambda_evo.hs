@@ -18,6 +18,7 @@ import Data.Foldable
 import Data.Functor.Identity
 import Data.List (sortBy)
 import Data.Maybe (catMaybes, fromJust)
+import Data.Monoid
 import Data.Ord (comparing)
 import Data.Traversable
 import Data.Void
@@ -30,32 +31,26 @@ import qualified Data.Map.Strict as Map
 import qualified Data.MemoCombinators as Memo
 import qualified Text.Printf as Printf
 
-class (Functor m, Monad m) => MonadStep m where
-  step :: m ()
-
--- TODO convert this to CPS for speed
-newtype AbortT m a = AbortT (MaybeT (RWS.RWST Int () Int m) a)
+newtype LimitT m a = LimitT (RWS.RWST Int Any Int m a)
   deriving (Functor, Applicative, Monad)
 
-runAbortT :: (Functor m, Monad m) => Int -> AbortT m a -> m (Maybe a)
-runAbortT limit (AbortT m) = fst <$> RWS.evalRWST (runMaybeT m) limit 0
+runLimitT :: (Functor m, Monad m) => Int -> AbortT m a -> m (a, Bool)
+runLimitT limit (LimitT m) = second getAny . fst <$> RWS.evalRWST (runMaybeT m) limit 0
 
-runAbort :: Int -> AbortT Identity a -> Maybe a
-runAbort limit m = runIdentity (runAbortT limit m)
+runLimit :: Int -> LimitT Identity a -> (a, Bool)
+runLimit limit m = runIdentity (runAbortT limit m)
 
-instance (Functor m, Monad m) => MonadStep (AbortT m) where
-  step = AbortT $ do
-    limit <- lift RWS.ask
-    cur <- lift RWS.get
-    if cur < limit
-      then lift . RWS.put $! cur+1
-      else empty
-
-newtype DoesntAbortT m a = DoesntAbortT { runDoesntAbortT :: m a }
-  deriving (Functor, Applicative, Monad)
-
-instance (Functor m, Monad m) => MonadStep (DoesntAbortT m) where
-  step = return ()
+step :: (Monad m) => a -> LimitT m a -> LimitT m a
+step def (LimitT comp) = LimitT $ do
+  steps <- get
+  limit <- ask
+  if steps < limit
+    then do
+      put $! steps+1
+      comp
+    else do
+      tell $ Any True
+      return def
 
 ---------------
 
@@ -85,14 +80,12 @@ dBInstantiate = instantiate (const (Var Nothing)) . fmap Just
 dBAbstract :: Term (Maybe a) -> Scope () Term a
 dBAbstract = fromJust . sequenceA . abstract (\case Nothing -> Just (); Just _ -> Nothing)
 
-normalize :: (MonadStep m) => Term a -> m (Term a)
+normalize :: (Monad m) => Term a -> LimitT m (Term a)
 normalize (Var v) = return (Var v)
 normalize (a :@ b) = do
   a' <- normalize a
   case a' of
-    Lam body -> do
-      step
-      normalize (instantiate1 b body)
+    Lam body -> step id normalize <*> instantiate1 b body
     other -> (other :@) <$> normalize b
 normalize (Lam body) = do
   let body' = dBInstantiate body
@@ -195,6 +188,8 @@ showTerm = \t -> State.evalState (go False False t) (tail varNames)
 -- form as `t`, but has `I` as a subterm, so `I` would gain some value from it.
 -- But `I` is adding nothing.  Can we make it so that `I` does not gain?
 
+_SIZELIMIT_ = 10000
+_
 _LIMIT_ = 100
 _STEPSIZE_ = 0.01
 _TERMSIZE_ = 50
