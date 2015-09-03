@@ -212,12 +212,12 @@ normalize' = go _SET_LIMIT_
 deltas :: Term Void -> Maybe (Term Void, [(Double, Term Void)])
 deltas t = do
   normT <- normalize' t
-  let tSize = termSize normT
-  let subs = catMaybes (normalize' <$> closedSubterms t)
+  let tSize = termSize t
+  let subs = [ (s,s') | s <- closedSubterms t, Just s' <- [normalize' s] ]
   let scale = 1 / fromIntegral (length subs)
   guard $ not (null subs)
-  let dels = map (\s -> ((termSize s/.tSize)*scale,s)) subs
-  sum (map fst dels) `seq` return (normT, dels)
+  let dels = [ (termSize s/.tSize, s') | (s,s') <- subs ]
+  return (normT, dels)
   where
   x /. y = fromIntegral x / fromIntegral y
 
