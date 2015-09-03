@@ -103,6 +103,11 @@ subterms (Var x) = []
 subterms (t :@ u) = [t,u] ++ subterms t ++ subterms u
 subterms (Lam body) = catMaybes (map sequenceA (subterms (dBInstantiate body)))
 
+termSize :: (Num b) => Term a -> b
+termSize (Var x) = 1
+termSize (t :@ u) = 1 + termSize t + termSize u
+termSize (Lam body) = 1 + termSize (dBInstantiate body)
+
 type Cloud = Rand.Rand Rand.StdGen
 
 genTerm :: [(Cloud a, Rational)] -> Int -> Cloud (Term a)
@@ -134,6 +139,22 @@ termsOfSize = Memo.memo2 Memo.integral Memo.integral go
     sum [ termsOfSize vars n * termsOfSize vars ((size-1)-n) | n <- [1..(size-1)-1] ] + -- apply
     termsOfSize (vars+1) (size-1)
 
+normalTermsOfSize :: Integer -> Integer
+normalTermsOfSize = withLambdas 0
+  where
+  withLambdas = Memo.memo2 Memo.integral Memo.integral go
+    where
+    go _ 0 = 0
+    go vars 1 = vars
+    go vars size = applies vars size + withLambdas (vars+1) (size-1)
+
+  nonLambdas = Memo.memo2 Memo.integral Memo.integral go
+    where
+    go _ 0 = 0
+    go vars 1 = vars
+    go vars size = applies vars size
+
+  applies vars size = sum [ nonLambdas vars n * withLambdas vars ((size-1)-n) | n <- [1..(size-1)-1] ]
 
 data NameDB a = Name String | Up a
 instance (Show a) => Show (NameDB a) where
@@ -174,7 +195,7 @@ showTerm = \t -> State.evalState (go False False t) (tail varNames)
 -- form as `t`, but has `I` as a subterm, so `I` would gain some value from it.
 -- But `I` is adding nothing.  Can we make it so that `I` does not gain?
 
-_LIMIT_ = 500
+_LIMIT_ = 100
 _STEPSIZE_ = 0.01
 _TERMSIZE_ = 50
 
@@ -187,7 +208,13 @@ deltas t = do
   let subs = catMaybes (normalize' <$> subterms normT)
   let scale = 1 / fromIntegral (length subs)
   guard $ not (null subs)
-  return (normT, {-(-1, normT) :-} map (scale,) subs)
+  -- (termsize s)^2:
+  --   One termsize s because smaller terms will be traversed more frequently
+  --     in proportion to their size.  (They are also more likely to be closed?)
+  --   Another termsize s because there are fewer small terms than large ones,
+  --     proportional to log (termsOfSize 0 (termSize s)) =~ termSize s.
+  --     The log is a gut feeling right now...
+  return (normT, map (\s -> ((termSize s)^2 * scale,s)) subs)
 
 genFlow :: forall a. (Ord a) => Cloud a -> (a -> Maybe (a, [(Double, a)]))
                              -> Cloud [Map.Map a Double]
@@ -224,11 +251,11 @@ showPrompt s = putStrLn s >> return ()
 
 snipe :: Int -> [a] -> [a]
 snipe n [] = []
-snipe n (x:xs) = x : snipe n (drop (n-1) xs)
+snipe n (x:xs) = x `seq` (x : snipe n (drop (n-1) xs))
 
 main :: IO ()
 main = do
   gen <- Rand.newStdGen
   let flow = genFlow (genTerm [] _TERMSIZE_) deltas
   let flowValues = Rand.evalRand flow gen
-  mapM_ (showPrompt.displayFlowState) . snipe 100 $ flowValues
+  mapM_ (showPrompt.displayFlowState) . snipe 1000 $ flowValues
