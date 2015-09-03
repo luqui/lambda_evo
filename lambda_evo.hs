@@ -210,10 +210,13 @@ normalize' = go _SET_LIMIT_
 deltas :: Term Void -> Maybe (Term Void, [(Double, Term Void)])
 deltas t = do
   normT <- normalize' t
+  let tSize = termSize normT
   let subs = catMaybes (normalize' <$> closedSubterms t)
   let scale = 1 / fromIntegral (length subs)
   guard $ not (null subs)
-  return (normT, map (\s -> (termSize s * scale,s)) subs)
+  return (normT, map (\s -> ((termSize s/.tSize)*scale,s)) subs)
+  where
+  x /. y = fromIntegral x / fromIntegral y
 
 genFlow :: forall a. (Ord a) => Cloud a -> (a -> Maybe (a, [(Double, a)]))
                              -> Cloud [Map.Map a Double]
