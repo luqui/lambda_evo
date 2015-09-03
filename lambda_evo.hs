@@ -11,7 +11,7 @@ import Prelude hiding (concat, mapM_, sum)
 import Bound
 import Control.Applicative
 import Control.Arrow (first, second, (>>>))
-import Control.Monad (ap, guard, join)
+import Control.Monad (ap, guard, join, replicateM)
 import Control.Monad.Trans
 import Control.Monad.Trans.Maybe
 import Data.Foldable
@@ -22,11 +22,13 @@ import Data.Monoid
 import Data.Ord (comparing)
 import Data.Traversable
 import Data.Void
+import GHC.Conc (numCapabilities)
 import Prelude.Extras
 
 import qualified Control.Monad.Random as Rand
 import qualified Control.Monad.Trans.State as State
 import qualified Control.Monad.Trans.RWS as RWS
+import qualified Control.Parallel.Strategies as Parallel
 import qualified Data.Map.Strict as Map
 import qualified Data.MemoCombinators as Memo
 import qualified Text.Printf as Printf
@@ -191,11 +193,11 @@ showTerm = \t -> State.evalState (go False False t) (tail varNames)
 -- form as `t`, but has `I` as a subterm, so `I` would gain some value from it.
 -- But `I` is adding nothing.  Can we make it so that `I` does not gain?
 
-_SIZE_LIMIT_ = 1000
-_REDUCTIONS_PER_SET_ = 10
+_SIZE_LIMIT_ = 1000 :: Int
+_REDUCTIONS_PER_SET_ = 10 :: Int
 _SET_LIMIT_ = 100 :: Int
-_STEP_SIZE_ = 0.01
-_INITIAL_TERM_SIZE_ = 50
+_STEP_SIZE_ = 0.01 :: Double 
+_INITIAL_TERM_SIZE_ = 50 :: Int
 
 normalize' :: Term a -> Maybe (Term a)
 normalize' = go _SET_LIMIT_
@@ -214,21 +216,26 @@ deltas t = do
   let subs = catMaybes (normalize' <$> closedSubterms t)
   let scale = 1 / fromIntegral (length subs)
   guard $ not (null subs)
-  return (normT, map (\s -> ((termSize s/.tSize)*scale,s)) subs)
+  let dels = map (\s -> ((termSize s/.tSize)*scale,s)) subs
+  sum (map fst dels) `seq` return (normT, dels)
   where
   x /. y = fromIntegral x / fromIntegral y
 
-genFlow :: forall a. (Ord a) => Cloud a -> (a -> Maybe (a, [(Double, a)]))
-                             -> Cloud [Map.Map a Double]
-genFlow genA f = iterateM (step _STEP_SIZE_) Map.empty
+genFlow :: forall a. 
+  (Ord a) => Int -> Cloud a -> (a -> Maybe (a, [(Double, a)]))
+          -> Cloud [Map.Map a Double]
+genFlow threads genA f = iterateM (step _STEP_SIZE_) Map.empty
   where
   step :: Double -> Map.Map a Double -> Cloud (Map.Map a Double)
   step dt m0 = do
-    a <- genA
-    return $ case f a of
+    ts <- replicateM threads genA
+    let fts = Parallel.runEval (Parallel.parList Parallel.rseq (map f ts))
+    return $! foldl' addDeltas m0 fts
+    where
+    addDeltas m0 ft = case ft of
       Nothing -> m0
-      Just (a', dels) ->
-        let weight = Map.findWithDefault 1 a' m0 in
+      Just (t', dels) ->
+        let weight = Map.findWithDefault 1 t' m0 in
         foldl' (\m (δ,x) -> accumDefault 1 (+ dt*weight*δ) x m) m0 dels
 
 accumDefault :: (Ord k) => a -> (a -> a) -> k -> Map.Map k a -> Map.Map k a
@@ -257,9 +264,11 @@ snipe n (x:xs) = x `seq` (x : snipe n (drop (n-1) xs))
 
 main :: IO ()
 main = do
+  let processors = max (numCapabilities-1) 1
+  putStrLn $ "Using " ++ show processors ++ " processors"
   gen <- Rand.newStdGen
-  let flow = genFlow (genTerm [] _INITIAL_TERM_SIZE_) deltas
+  let flow = genFlow processors (genTerm [] _INITIAL_TERM_SIZE_) deltas
   let flowValues = Rand.evalRand flow gen
-  mapM_ (showPrompt.displayFlowState) . snipe 1000 $ flowValues
+  mapM_ (showPrompt.displayFlowState) . snipe (1260 `div` processors) $ flowValues
 
 -- vim: sw=2 :
