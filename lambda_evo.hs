@@ -10,7 +10,7 @@ import Prelude hiding (concat, mapM_, sum)
 
 import Bound
 import Control.Applicative
-import Control.Arrow (first, (>>>))
+import Control.Arrow (first, second, (>>>))
 import Control.Monad (ap, guard, join)
 import Control.Monad.Trans
 import Control.Monad.Trans.Maybe
@@ -34,22 +34,22 @@ import qualified Text.Printf as Printf
 newtype LimitT m a = LimitT (RWS.RWST Int Any Int m a)
   deriving (Functor, Applicative, Monad)
 
-runLimitT :: (Functor m, Monad m) => Int -> AbortT m a -> m (a, Bool)
-runLimitT limit (LimitT m) = second getAny . fst <$> RWS.evalRWST (runMaybeT m) limit 0
+runLimitT :: (Functor m, Monad m) => Int -> LimitT m a -> m (a, Bool)
+runLimitT limit (LimitT m) = second getAny <$> RWS.evalRWST m limit 0
 
 runLimit :: Int -> LimitT Identity a -> (a, Bool)
-runLimit limit m = runIdentity (runAbortT limit m)
+runLimit limit m = runIdentity (runLimitT limit m)
 
 step :: (Monad m) => a -> LimitT m a -> LimitT m a
 step def (LimitT comp) = LimitT $ do
-  steps <- get
-  limit <- ask
+  steps <- RWS.get
+  limit <- RWS.ask
   if steps < limit
     then do
-      put $! steps+1
+      RWS.put $! steps+1
       comp
     else do
-      tell $ Any True
+      RWS.tell $ Any True
       return def
 
 ---------------
@@ -80,12 +80,12 @@ dBInstantiate = instantiate (const (Var Nothing)) . fmap Just
 dBAbstract :: Term (Maybe a) -> Scope () Term a
 dBAbstract = fromJust . sequenceA . abstract (\case Nothing -> Just (); Just _ -> Nothing)
 
-normalize :: (Monad m) => Term a -> LimitT m (Term a)
+normalize :: (Functor m, Monad m) => Term a -> LimitT m (Term a)
 normalize (Var v) = return (Var v)
 normalize (a :@ b) = do
   a' <- normalize a
   case a' of
-    Lam body -> step id normalize <*> instantiate1 b body
+    Lam body -> step (a' :@ b) (normalize (instantiate1 b body))
     other -> (other :@) <$> normalize b
 normalize (Lam body) = do
   let body' = dBInstantiate body
@@ -188,14 +188,21 @@ showTerm = \t -> State.evalState (go False False t) (tail varNames)
 -- form as `t`, but has `I` as a subterm, so `I` would gain some value from it.
 -- But `I` is adding nothing.  Can we make it so that `I` does not gain?
 
-_SIZELIMIT_ = 10000
-_
-_LIMIT_ = 100
-_STEPSIZE_ = 0.01
-_TERMSIZE_ = 50
+_SIZE_LIMIT_ = 1000
+_REDUCTIONS_PER_SET_ = 10
+_SET_LIMIT_ = 100 :: Int
+_STEP_SIZE_ = 0.01
+_INITIAL_TERM_SIZE_ = 50
 
 normalize' :: Term a -> Maybe (Term a)
-normalize' = runAbort _LIMIT_ . normalize
+normalize' = go _SET_LIMIT_
+  where
+  go 0 _ = Nothing
+  go sets t = case runSet t of
+                (t', True) | termSize t' < _SIZE_LIMIT_ -> go (sets-1) t'
+                           | otherwise -> Nothing
+                (t', False) -> Just t'
+  runSet = runLimit _REDUCTIONS_PER_SET_ . normalize
 
 deltas :: Term Void -> Maybe (Term Void, [(Double, Term Void)])
 deltas t = do
@@ -213,7 +220,7 @@ deltas t = do
 
 genFlow :: forall a. (Ord a) => Cloud a -> (a -> Maybe (a, [(Double, a)]))
                              -> Cloud [Map.Map a Double]
-genFlow genA f = iterateM (step _STEPSIZE_) Map.empty
+genFlow genA f = iterateM (step _STEP_SIZE_) Map.empty
   where
   step :: Double -> Map.Map a Double -> Cloud (Map.Map a Double)
   step dt m0 = do
@@ -251,6 +258,8 @@ snipe n (x:xs) = x `seq` (x : snipe n (drop (n-1) xs))
 main :: IO ()
 main = do
   gen <- Rand.newStdGen
-  let flow = genFlow (genTerm [] _TERMSIZE_) deltas
+  let flow = genFlow (genTerm [] _INITIAL_TERM_SIZE_) deltas
   let flowValues = Rand.evalRand flow gen
   mapM_ (showPrompt.displayFlowState) . snipe 1000 $ flowValues
+
+-- vim: sw=2 :
